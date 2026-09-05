@@ -3,8 +3,6 @@ on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch: {}
-permissions:
-  contents: write
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -13,16 +11,16 @@ jobs:
         run: |
           set -euo pipefail
           git clone https://github.com/lyoneel/dirly.git repo
-          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/lyoneel/dirly.git"
           cd repo
           git config user.name 'Sync Bot'
           git config user.email 'sync-bot@localhost'
+          git remote set-url origin "https://x-access-token:${{ secrets.SYNC_PUSH_TOKEN }}@github.com/lyoneel/dirly.git"
           git fetch https://gitlab.com/lyoneel/dirly.git '+refs/heads/*:refs/remotes/gitlab/*' '+refs/tags/*:refs/tags/*'
           if git show-ref --verify --quiet refs/remotes/gitlab/master; then
             git merge --no-ff --no-edit --allow-unrelated-histories gitlab/master
             git push --force origin master
           fi
-          for b in $(git for-each-ref --format='%(refname:short)' refs/remotes/gitlab); do
+          for b in $(git for-each-ref --format='$(refname:short)' refs/remotes/gitlab); do
             if [ "$b" = "master" ]; then
               continue
             fi
