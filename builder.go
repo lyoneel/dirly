@@ -14,6 +14,7 @@ type DirectoryBuilder struct {
 	defaultUID    int // -1 = no change
 	defaultGID    int // -1 = no change
 	defaultPerm   os.FileMode
+	symlinkPolicy SymlinkPolicy
 }
 
 // NewFilteredDirectory returns a builder for filtered directories.
@@ -23,6 +24,9 @@ func NewFilteredDirectory(basePath string) *DirectoryBuilder {
 		config:        FilterConfig{},
 		matchNested:   true,  // default: match nested directories
 		caseSensitive: false, // default: OS behavior via filepath.Match
+		defaultUID:    -1,    // default: no ownership change
+		defaultGID:    -1,    // default: no ownership change
+		symlinkPolicy: FollowWithinRoot,
 	}
 }
 
@@ -80,8 +84,10 @@ func (b *DirectoryBuilder) CaseSensitive(sensitive bool) *DirectoryBuilder {
 	return b
 }
 
-// WithDefaultOwnership sets default UID/GID for all new files written to this directory.
-// Use -1 to skip setting a specific value.
+// WithDefaultOwnership sets default UID/GID for all files written to this directory.
+// Use -1 to skip setting a specific value. If the ownership cannot be applied
+// (for example when not running as root), the write fails with an error
+// wrapping ErrOwnership and the target file is left unchanged.
 func (b *DirectoryBuilder) WithDefaultOwnership(uid, gid int) *DirectoryBuilder {
 	b.defaultUID = uid
 	b.defaultGID = gid
@@ -95,12 +101,28 @@ func (b *DirectoryBuilder) WithDefaultPermissions(perm os.FileMode) *DirectoryBu
 	return b
 }
 
+// WithSymlinkPolicy sets how symlinks below the directory root are treated.
+// The default is FollowWithinRoot. See SymlinkPolicy.
+func (b *DirectoryBuilder) WithSymlinkPolicy(policy SymlinkPolicy) *DirectoryBuilder {
+	b.symlinkPolicy = policy
+	return b
+}
+
 // Build creates the Directory with the configured filters.
-// Filters are immutable after this point.
+// Filters are immutable after this point. The base path is resolved through
+// symlinks here (see NewDirectory).
 func (b *DirectoryBuilder) Build() *Directory {
+	config := FilterConfig{
+		IncludePatterns:   append([]string(nil), b.config.IncludePatterns...),
+		ExcludePatterns:   append([]string(nil), b.config.ExcludePatterns...),
+		AllowedExtensions: append([]string(nil), b.config.AllowedExtensions...),
+	}
+	realRoot, _ := resolveRoot(b.basePath)
 	return &Directory{
 		basePath:      b.basePath,
-		filterConfig:  b.config,
+		realRoot:      realRoot,
+		symlinkPolicy: b.symlinkPolicy,
+		filterConfig:  config,
 		useFastPath:   b.config.isEmpty(),
 		matchNested:   b.matchNested,
 		caseSensitive: b.caseSensitive,
