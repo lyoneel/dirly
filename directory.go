@@ -218,14 +218,7 @@ func (d *Directory) Exists(filename string) bool {
 
 // ReadToBytes reads a file in this directory and returns raw bytes.
 func (d *Directory) ReadToBytes(filename string) ([]byte, error) {
-	if filename == "" {
-		return nil, fmt.Errorf("filename cannot be empty")
-	}
-	t, err := d.resolveTarget(filename, true, false)
-	if err != nil {
-		return nil, err
-	}
-	f, err := d.open(t)
+	f, err := d.Open(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -414,44 +407,86 @@ func (d *Directory) WriteFromLines(filename string, lines []string, perm os.File
 	return d.writeWithOwnership(filename, data, finalPerm)
 }
 
-// ReadToBuff returns a buffered reader for efficient streaming reads.
-func (d *Directory) ReadToBuff(filename string) (*os.File, *bufio.Reader, error) {
-	if filename == "" {
-		return nil, nil, fmt.Errorf("filename cannot be empty")
-	}
+// Open opens a file in this directory for reading and returns the *os.File,
+// with no buffering added. The caller must close it.
+//
+// Open applies the same checks as the other read helpers (ReadToBytes,
+// ReadToBuff, ReadToScanner): the name must be relative and stay inside the
+// directory, and the symlink policy is enforced. Under FollowWithinRoot and
+// NoFollow the file is opened through an os.Root at the resolved root, so a
+// path component swapped for a symlink after the check still cannot escape
+// it. Under FollowAny the resolved path is opened directly. Like the other
+// read helpers, Open does not apply the builder's extension or pattern
+// filters, and it opens directories as os.Open does.
+//
+// Errors are returned unwrapped where possible: a failed open is the
+// *fs.PathError from the OS, so os.IsNotExist, os.IsPermission, and
+// errors.Is with os.ErrNotExist or os.ErrPermission all work. Policy
+// refusals match errors.Is with ErrPathEscapesRoot or ErrSymlinkNotAllowed;
+// those found while resolving the name are *SymlinkError values.
+func (d *Directory) Open(filename string) (*os.File, error) {
+	file, _, err := d.openForRead(filename)
+	return file, err
+}
 
-	t, err := d.resolveTarget(filename, true, false)
+// openForRead validates filename, resolves it under the symlink policy and
+// opens it for reading. openFailed reports whether the error came from the
+// open itself (after validation and policy checks passed), so the Read*
+// helpers can keep their "failed to open file" wrapping.
+func (d *Directory) openForRead(filename string) (file *os.File, openFailed bool, err error) {
+	t, err := d.readTarget(filename)
+	if err != nil {
+		return nil, false, err
+	}
+	file, err = d.open(t)
+	if err != nil {
+		return nil, true, err
+	}
+	return file, false, nil
+}
+
+// readTarget validates filename and resolves it for a read under the
+// symlink policy. It is shared by Open and the Read* helpers.
+func (d *Directory) readTarget(filename string) (target, error) {
+	if filename == "" {
+		return target{}, fmt.Errorf("filename cannot be empty")
+	}
+	return d.resolveTarget(filename, true, false)
+}
+
+// openForHelper is openForRead with the error wrapping ReadToBuff and
+// ReadToScanner have always used for open failures.
+func (d *Directory) openForHelper(filename string) (*os.File, error) {
+	file, openFailed, err := d.openForRead(filename)
+	if err != nil {
+		if openFailed {
+			return nil, fmt.Errorf("failed to open file: %w", err)
+		}
+		return nil, err
+	}
+	return file, nil
+}
+
+// ReadToBuff returns a buffered reader for efficient streaming reads.
+// It applies the same checks as Open and adds a bufio.Reader; use Open when
+// no buffering is needed.
+func (d *Directory) ReadToBuff(filename string) (*os.File, *bufio.Reader, error) {
+	file, err := d.openForHelper(filename)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	file, err := d.open(t)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open file: %w", err)
-	}
-
-	reader := bufio.NewReader(file)
-	return file, reader, nil
+	return file, bufio.NewReader(file), nil
 }
 
 // ReadToScanner returns a scanner for reading a file line by line.
+// It applies the same checks as Open and adds a bufio.Scanner with the
+// default buffer limits.
 func (d *Directory) ReadToScanner(filename string) (*os.File, *bufio.Scanner, error) {
-	if filename == "" {
-		return nil, nil, fmt.Errorf("filename cannot be empty")
-	}
-
-	t, err := d.resolveTarget(filename, true, false)
+	file, err := d.openForHelper(filename)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	file, err := d.open(t)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open file: %w", err)
-	}
-
-	scanner := bufio.NewScanner(file)
-	return file, scanner, nil
+	return file, bufio.NewScanner(file), nil
 }
 
 // Remove removes a file from this directory.
