@@ -12,7 +12,8 @@ A standalone Go library for directory operations with powerful file filtering ca
 - **Builder pattern** for immutable configuration
 - **Flexible file matching** with support for wildcards, recursive patterns (`**/`), and path-based filters
 - **Case-sensitive or case-insensitive** matching (OS default)
-- **Path traversal protection** against security vulnerabilities
+- **Path traversal protection** against security vulnerabilities, including symlink escapes
+- **Atomic writes** (temp file, fsync, rename), so a crash never leaves a half-written file
 - **Batch operations** for efficient file handling
 - **Multiple I/O modes**: bytes, strings, lines, bufio.Reader, *bufio.Scanner
 
@@ -26,7 +27,7 @@ go get gitlab.com/lyoneel/dirly
 import "gitlab.com/lyoneel/dirly"
 ```
 
-Requires Go 1.26 or later. The library has no external dependencies.
+Requires Go 1.26.11 or later. The library has no external dependencies.
 
 ## Quick Start
 
@@ -58,14 +59,14 @@ func main() {
 
 | Constructor | Purpose |
 |-------------|---------|
-| `NewDirectory(basePath string) *Directory` | Unfiltered directory. All files pass. Uses a fast path when no filters are configured. |
+| `NewDirectory(basePath string) *Directory` | Unfiltered directory. All files pass. Uses a fast path when no filters are configured. Default symlink policy. |
 | `NewFilteredDirectory(basePath string) *DirectoryBuilder` | Builder for a filtered, immutable `Directory`. Chain configuration methods, then call `Build()`. |
 
 Key operations on the resulting `*Directory`:
 
 | Group | Methods |
 |-------|---------|
-| Inspection | `BasePath`, `FilterConfig`, `Exists`, `AbsPath` |
+| Inspection | `BasePath`, `ResolvedBasePath`, `SymlinkPolicy`, `FilterConfig`, `Exists`, `AbsPath` |
 | Single-file read | `ReadToBytes`, `ReadToString`, `ReadToLines`, `ReadToBuff`, `ReadToScanner` |
 | Single-file write | `WriteFromBytes`, `WriteFromString`, `WriteFromLines`, `WriteFromBuff`, `WriteFromScanner` |
 | Batch I/O | `BatchReadToBytes`, `BatchReadToLines`, `BatchWriteFromBytes`, `BatchWriteFromLines`, and the matching Buff and Scanner variants |
@@ -92,6 +93,46 @@ Path traversal protection is built in:
 1. Absolute paths and `..` sequences in file names are rejected.
 2. Glob patterns containing `..` are rejected before any file system access.
 3. Glob results are validated to stay within the base directory.
+4. Symlinks are resolved and checked against the directory root, as described under Symlinks.
+
+### Symlinks
+
+The base path is resolved through symlinks once, when the `Directory` is created. A base path that is itself a symlink, such as `~/.config/app -> ~/Sync/app` for a config folder synced across devices, works under every policy, and its real location becomes the boundary. If the base path doesn't exist yet, it is resolved on each operation until it does.
+
+Symlinks below the root follow the policy set with `WithSymlinkPolicy`:
+
+| Policy | Behavior |
+|--------|----------|
+| `FollowWithinRoot` (default) | Symlinks are followed, but an operation whose resolved target is outside the root fails with an error wrapping `ErrPathEscapesRoot`. This also covers writes to new files and dangling links. |
+| `FollowAny` | Symlinks are followed anywhere. This is the v1.1.0 behavior. `../` and absolute names are still rejected. |
+| `NoFollow` | Any path through a symlink below the root fails with an error wrapping `ErrSymlinkNotAllowed`. |
+
+```go
+dir := dirly.NewFilteredDirectory("~/.config/app"). // may be a symlink to a synced folder
+    WithSymlinkPolicy(dirly.FollowWithinRoot).        // the default
+    Build()
+
+_, err := dir.ReadToString("link-to-etc/passwd")
+if errors.Is(err, dirly.ErrPathEscapesRoot) {
+    // refused: the link resolves outside the directory
+}
+```
+
+Removing a symlink removes the link, never its target. Writing through an allowed symlink updates the target file and leaves the link in place.
+
+Limitations, stated plainly:
+
+- `FollowWithinRoot` and `NoFollow` run file operations through Go's `os.Root`, opened at the resolved root. On Linux, macOS, BSD, and Windows, a symlink swapped in after dirly's check still cannot make an operation escape the root. A swap can still redirect an operation to a different file *inside* the root, and under `NoFollow` a symlink created after the check may be followed, though only within the root. On `GOOS=js`, `os.Root` itself is vulnerable to these races. `Chmod` and `Chown` on Unix share `os.Root`'s documented race, where a file replaced by a symlink mid-call may have the link changed instead.
+- If the base path symlink is later pointed somewhere else, an existing `Directory` keeps the location it resolved at construction.
+- Hard links and bind mounts are not detected. Anyone who can already write into the directory can still replace its files. The policy stops links from quietly pulling reads and writes outside the directory.
+
+### Writes and Ownership
+
+Every write is atomic. Data goes to a temporary `.<name>.tmp-*` file in the target's directory, is fsynced, and is then renamed over the target. On POSIX the directory is then fsynced, best effort. A crash leaves either the old or the new content, and at worst a stale temp file.
+
+- New files get the requested permissions (or the default), subject to umask. Existing files keep their mode and, on Unix, their owner and group.
+- If `WithDefaultOwnership`, or keeping the original owner, can't be applied, the write fails with an error wrapping `ErrOwnership` and the target is left unchanged. Ownership is never ignored silently.
+- Replacing a file needs write permission on its directory.
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for the path resolution and validation internals.
 
@@ -146,7 +187,7 @@ More examples cover batch operations, streaming with scanners and buffered reade
 Run the comprehensive test suite:
 
 ```bash
-go test ./... -v
+go test -race -cover ./...
 ```
 
 Tests cover:
@@ -154,6 +195,8 @@ Tests cover:
 - File matching with various patterns (`*.yaml`, `config/*.yaml`, `**/*.yaml`)
 - Both nested and flat matching modes for filters AND glob operations
 - Path traversal protection (absolute paths, `..` sequences, encoded traversals)
+- Symlink policies (escape refusal, in-root links, symlinked base paths, `FollowAny`, `NoFollow`)
+- Atomic writes (no temp files left, mode preserved, writes through symlinks, concurrent writers, ownership errors)
 - All directory operations (ReadToBytes, ReadToString, ReadToLines, WriteFromBytes, WriteFromString, WriteFromLines, etc.)
 - Batch operations for all I/O modes (bytes, strings, lines, bufio.Reader, *bufio.Scanner)
 - Glob pattern behavior with `matchNested` setting (new tests in `glob_nested_test.go`)

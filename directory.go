@@ -5,8 +5,10 @@ package dirly
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,17 +17,31 @@ import (
 // Directory represents a directory with file operations.
 type Directory struct {
 	basePath      string
-	filterConfig  FilterConfig // set only during construction via builder
-	useFastPath   bool         // computed at construction time - true if no filters (fast path)
-	matchNested   bool         // default: true, matches against full relative path
-	caseSensitive bool         // default: false (OS default), set to true for explicit case sensitivity
-	defaultUID    int          // default UID for new files (-1 = no change)
-	defaultGID    int          // default GID for new files (-1 = no change)
-	defaultPerm   os.FileMode  // default permissions for new files (0 = no change)
+	filterConfig  FilterConfig  // set only during construction via builder
+	useFastPath   bool          // computed at construction time - true if no filters (fast path)
+	matchNested   bool          // default: true, matches against full relative path
+	caseSensitive bool          // default: false (OS default), set to true for explicit case sensitivity
+	defaultUID    int           // default UID for new files (-1 = no change)
+	defaultGID    int           // default GID for new files (-1 = no change)
+	defaultPerm   os.FileMode   // default permissions for new files (0 = no change)
+	realRoot      string        // basePath resolved through symlinks at construction ("" if it did not exist)
+	symlinkPolicy SymlinkPolicy // how symlinks below the root are treated
 }
 
-// NewDirectory creates a new unfiltered Directory instance.
+// NewDirectory creates a new unfiltered Directory instance with the default
+// FollowWithinRoot symlink policy. Use NewFilteredDirectory(...).WithSymlinkPolicy
+// to pick another policy.
+//
+// basePath is resolved through symlinks once, here, so a base path that is a
+// symlink (e.g. to a synced folder) works and its real location becomes the
+// boundary for all operations. If basePath does not exist yet, it is resolved
+// at the time of each operation until it exists.
 func NewDirectory(basePath string) *Directory {
+	return newDirectory(basePath, FollowWithinRoot)
+}
+
+func newDirectory(basePath string, policy SymlinkPolicy) *Directory {
+	realRoot, _ := resolveRoot(basePath)
 	return &Directory{
 		basePath:      basePath,
 		filterConfig:  FilterConfig{}, // empty config
@@ -35,6 +51,8 @@ func NewDirectory(basePath string) *Directory {
 		defaultUID:    -1,             // no change by default
 		defaultGID:    -1,             // no change by default
 		defaultPerm:   0,              // no change by default
+		realRoot:      realRoot,
+		symlinkPolicy: policy,
 	}
 }
 
@@ -86,14 +104,14 @@ func (d *Directory) SubDirectory(name string) (*Directory, error) {
 		return nil, err
 	}
 
-	// Use resolvePath to validate path stays within base directory
-	fullPath, err := d.resolvePath(name)
+	// Validate the path textually and against the symlink policy
+	t, err := d.resolveTarget(name, true, false)
 	if err != nil {
 		return nil, err
 	}
 
 	// Check if it exists and is a directory
-	info, err := os.Stat(fullPath)
+	info, err := d.stat(t)
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat directory %q: %w", name, err)
 	}
@@ -102,8 +120,12 @@ func (d *Directory) SubDirectory(name string) (*Directory, error) {
 		return nil, fmt.Errorf("%q is not a directory", name)
 	}
 
-	// Reuse NewDirectory with the validated path
-	dir := NewDirectory(fullPath)
+	// Reuse NewDirectory with the validated path; the child inherits the
+	// policy and uses its resolved location as its own boundary.
+	dir := newDirectory(t.lexical, d.symlinkPolicy)
+	if t.real != "" {
+		dir.realRoot = t.real
+	}
 
 	// Preserve filter config from parent if it was set
 	if !d.useFastPath {
@@ -114,9 +136,42 @@ func (d *Directory) SubDirectory(name string) (*Directory, error) {
 	return dir, nil
 }
 
-// BasePath returns the base directory path.
+// BasePath returns the base directory path as given at construction.
 func (d *Directory) BasePath() string {
 	return d.basePath
+}
+
+// ResolvedBasePath returns the base path resolved through symlinks, which is
+// the boundary enforced by FollowWithinRoot and NoFollow. It returns an error
+// if the directory does not exist (yet).
+func (d *Directory) ResolvedBasePath() (string, error) {
+	return d.resolvedRoot()
+}
+
+// SymlinkPolicy returns the policy applied to symlinks below the root.
+func (d *Directory) SymlinkPolicy() SymlinkPolicy {
+	return d.symlinkPolicy
+}
+
+// stat stats a resolved target through the policy's file system.
+func (d *Directory) stat(t target) (os.FileInfo, error) {
+	fsys, name, err := d.openFS(t)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fsys.Close() }()
+	return fsys.Stat(name)
+}
+
+// open opens a resolved target for reading through the policy's file system.
+// The returned file stays valid after the os.Root is closed.
+func (d *Directory) open(t target) (*os.File, error) {
+	fsys, name, err := d.openFS(t)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fsys.Close() }()
+	return fsys.Open(name)
 }
 
 // FilterConfig returns a copy of the filter configuration.
@@ -135,12 +190,13 @@ func (d *Directory) Exists(filename string) bool {
 		return false
 	}
 
-	filePath, err := d.resolvePath(filename)
+	t, err := d.resolveTarget(filename, true, false)
 	if err != nil {
 		return false
 	}
+	filePath := t.lexical
 
-	info, err := os.Stat(filePath)
+	info, err := d.stat(t)
 	if err != nil {
 		return false
 	}
@@ -165,11 +221,16 @@ func (d *Directory) ReadToBytes(filename string) ([]byte, error) {
 	if filename == "" {
 		return nil, fmt.Errorf("filename cannot be empty")
 	}
-	filePath, err := d.resolvePath(filename)
+	t, err := d.resolveTarget(filename, true, false)
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(filePath)
+	f, err := d.open(t)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return io.ReadAll(f)
 }
 
 func (d *Directory) ReadToString(filename string) (string, error) {
@@ -204,14 +265,13 @@ func (d *Directory) WriteFromBytes(filename string, data []byte, perm os.FileMod
 		return fmt.Errorf("filename cannot be empty")
 	}
 
-	fullPath, err := d.resolvePath(filename)
-	if err != nil {
+	if _, err := d.resolvePath(filename); err != nil {
 		return err
 	}
 
 	finalPerm := d.applyDefaultPermissions(perm)
 
-	if err := d.writeWithOwnership(fullPath, data, finalPerm); err != nil {
+	if err := d.writeWithOwnership(filename, data, finalPerm); err != nil {
 		return err
 	}
 
@@ -229,37 +289,23 @@ func (d *Directory) applyDefaultPermissions(perm os.FileMode) os.FileMode {
 	return perm
 }
 
-// writeWithOwnership writes data to a file with specified permissions and applies ownership.
-func (d *Directory) writeWithOwnership(path string, data []byte, perm os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	if err := os.WriteFile(path, data, perm); err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
-	}
-
-	// Apply default ownership if configured (only if both UID and GID are valid)
-	// Note: Chown may fail on non-root systems; we log but don't fail the operation
-	if d.defaultUID >= 0 && d.defaultGID >= 0 {
-		_ = os.Chown(path, d.defaultUID, d.defaultGID) // Best effort
-	}
-
-	return nil
-}
-
 // Chown changes the owner and group of a file in this directory.
 func (d *Directory) Chown(filename string, uid, gid int) error {
 	if filename == "" {
 		return fmt.Errorf("filename cannot be empty")
 	}
 
-	fullPath, err := d.resolvePath(filename)
+	t, err := d.resolveTarget(filename, true, false)
 	if err != nil {
 		return err
 	}
+	fsys, name, err := d.openFS(t)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fsys.Close() }()
 
-	if err := os.Chown(fullPath, uid, gid); err != nil {
+	if err := fsys.Chown(name, uid, gid); err != nil {
 		return fmt.Errorf("failed to change owner/group: %w", err)
 	}
 	return nil
@@ -271,12 +317,17 @@ func (d *Directory) Chmod(filename string, perm os.FileMode) error {
 		return fmt.Errorf("filename cannot be empty")
 	}
 
-	fullPath, err := d.resolvePath(filename)
+	t, err := d.resolveTarget(filename, true, false)
 	if err != nil {
 		return err
 	}
+	fsys, name, err := d.openFS(t)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fsys.Close() }()
 
-	if err := os.Chmod(fullPath, perm); err != nil {
+	if err := fsys.Chmod(name, perm); err != nil {
 		return fmt.Errorf("failed to change permissions: %w", err)
 	}
 	return nil
@@ -288,8 +339,7 @@ func (d *Directory) WriteFromBuff(filename string, r *bufio.Reader, perm os.File
 		return fmt.Errorf("filename cannot be empty")
 	}
 
-	fullPath, err := d.resolvePath(filename)
-	if err != nil {
+	if _, err := d.resolvePath(filename); err != nil {
 		return err
 	}
 
@@ -300,7 +350,7 @@ func (d *Directory) WriteFromBuff(filename string, r *bufio.Reader, perm os.File
 		return fmt.Errorf("failed to read from buffer: %w", err)
 	}
 
-	return d.writeWithOwnership(fullPath, data, finalPerm)
+	return d.writeWithOwnership(filename, data, finalPerm)
 }
 
 // WriteFromString writes content from a string to a file with specified permissions.
@@ -309,14 +359,13 @@ func (d *Directory) WriteFromString(filename string, s string, perm os.FileMode)
 		return fmt.Errorf("filename cannot be empty")
 	}
 
-	fullPath, err := d.resolvePath(filename)
-	if err != nil {
+	if _, err := d.resolvePath(filename); err != nil {
 		return err
 	}
 
 	finalPerm := d.applyDefaultPermissions(perm)
 
-	return d.writeWithOwnership(fullPath, []byte(s), finalPerm)
+	return d.writeWithOwnership(filename, []byte(s), finalPerm)
 }
 
 // WriteFromScanner writes content from a scanner to a file with specified permissions.
@@ -325,8 +374,7 @@ func (d *Directory) WriteFromScanner(filename string, s *bufio.Scanner, perm os.
 		return fmt.Errorf("filename cannot be empty")
 	}
 
-	fullPath, err := d.resolvePath(filename)
-	if err != nil {
+	if _, err := d.resolvePath(filename); err != nil {
 		return err
 	}
 
@@ -342,7 +390,7 @@ func (d *Directory) WriteFromScanner(filename string, s *bufio.Scanner, perm os.
 		return fmt.Errorf("scanner error: %w", err)
 	}
 
-	return d.writeWithOwnership(fullPath, data, finalPerm)
+	return d.writeWithOwnership(filename, data, finalPerm)
 }
 
 // WriteFromLines writes content from a slice of strings (lines) to a file with specified permissions.
@@ -351,8 +399,7 @@ func (d *Directory) WriteFromLines(filename string, lines []string, perm os.File
 		return fmt.Errorf("filename cannot be empty")
 	}
 
-	fullPath, err := d.resolvePath(filename)
-	if err != nil {
+	if _, err := d.resolvePath(filename); err != nil {
 		return err
 	}
 
@@ -364,7 +411,7 @@ func (d *Directory) WriteFromLines(filename string, lines []string, perm os.File
 		data = append(data, '\n')
 	}
 
-	return d.writeWithOwnership(fullPath, data, finalPerm)
+	return d.writeWithOwnership(filename, data, finalPerm)
 }
 
 // ReadToBuff returns a buffered reader for efficient streaming reads.
@@ -373,12 +420,12 @@ func (d *Directory) ReadToBuff(filename string) (*os.File, *bufio.Reader, error)
 		return nil, nil, fmt.Errorf("filename cannot be empty")
 	}
 
-	fullPath, err := d.resolvePath(filename)
+	t, err := d.resolveTarget(filename, true, false)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	file, err := os.Open(fullPath)
+	file, err := d.open(t)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open file: %w", err)
 	}
@@ -393,12 +440,12 @@ func (d *Directory) ReadToScanner(filename string) (*os.File, *bufio.Scanner, er
 		return nil, nil, fmt.Errorf("filename cannot be empty")
 	}
 
-	fullPath, err := d.resolvePath(filename)
+	t, err := d.resolveTarget(filename, true, false)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	file, err := os.Open(fullPath)
+	file, err := d.open(t)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open file: %w", err)
 	}
@@ -412,11 +459,7 @@ func (d *Directory) Remove(filename string) error {
 	if filename == "" {
 		return fmt.Errorf("filename cannot be empty")
 	}
-	filePath, err := d.resolvePath(filename)
-	if err != nil {
-		return err
-	}
-	if err := os.Remove(filePath); err != nil {
+	if err := d.remove(filename, false); err != nil {
 		return fmt.Errorf("failed to delete file: %w", err)
 	}
 	return nil
@@ -424,11 +467,32 @@ func (d *Directory) Remove(filename string) error {
 
 // BatchRemoveAllFromDir removes a file or directory and all its contents.
 func (d *Directory) BatchRemoveAllFromDir(path string) error {
-	fullPath, err := d.resolvePath(path)
+	return d.remove(path, true)
+}
+
+// remove deletes relative (recursively if all is set). The final component is
+// not followed, so removing a symlink removes the link, never its target, even
+// when the link points outside the root. Parent components are resolved under
+// the symlink policy. Removing the base directory itself keeps the historical
+// behavior of operating on the base path as given.
+func (d *Directory) remove(relative string, all bool) error {
+	t, err := d.resolveTarget(relative, false, false)
 	if err != nil {
 		return err
 	}
-	return os.RemoveAll(fullPath)
+	var fsys fileSystem = hostFS{}
+	name := t.lexical
+	if t.lexical != filepath.Clean(d.basePath) {
+		fsys, name, err = d.openFS(t)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = fsys.Close() }()
+	}
+	if all {
+		return fsys.RemoveAll(name)
+	}
+	return fsys.Remove(name)
 }
 
 // BatchRemove removes multiple files or directories.
@@ -439,11 +503,10 @@ func (d *Directory) BatchRemove(paths []string) error {
 	}
 
 	for _, path := range paths {
-		fullPath, err := d.resolvePath(path)
-		if err != nil {
+		if _, err := d.resolvePath(path); err != nil {
 			return fmt.Errorf("invalid path %q: %w", path, err)
 		}
-		if err := os.RemoveAll(fullPath); err != nil {
+		if err := d.remove(path, true); err != nil {
 			return fmt.Errorf("failed to remove %q: %w", path, err)
 		}
 	}
@@ -506,7 +569,7 @@ func (d *Directory) getByGlob(pattern string) ([]string, error) {
 		}
 	} else {
 		// No filters - walk directory to get all files (so matchNested can be applied)
-		err = filepath.WalkDir(d.basePath, func(path string, entry os.DirEntry, err error) error {
+		err = d.walkDir(func(path string, entry os.DirEntry, err error) error {
 			if err != nil || entry.IsDir() {
 				return err
 			}
@@ -600,7 +663,7 @@ func (d *Directory) GetAllByGlobRel(pattern string) ([]string, error) {
 func (d *Directory) GetAllAbs() ([]string, error) {
 	var files []string
 
-	err := filepath.WalkDir(d.basePath, func(path string, entry os.DirEntry, err error) error {
+	err := d.walkDir(func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -630,7 +693,7 @@ func (d *Directory) GetAllAbs() ([]string, error) {
 func (d *Directory) GetAllDirsAbs() ([]string, error) {
 	var dirs []string
 
-	err := filepath.WalkDir(d.basePath, func(path string, entry os.DirEntry, err error) error {
+	err := d.walkDir(func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -724,9 +787,36 @@ func (d *Directory) isPathWithinBase(path string) bool {
 	return cleaned == d.basePath || strings.HasPrefix(cleaned, baseForCheck)
 }
 
-// AbsPath returns the resolved absolute path for a relative path.
+// AbsPath returns the absolute path for a relative path, in base-path form
+// (symlinks are not expanded in the result). The path is validated against
+// the symlink policy, so a name that escapes through a symlink is refused.
 func (d *Directory) AbsPath(name string) (string, error) {
-	return d.resolvePath(name)
+	t, err := d.resolveTarget(name, true, false)
+	if err != nil {
+		return "", err
+	}
+	return t.lexical, nil
+}
+
+// walkDir walks the resolved root (so a symlinked base path is traversed) and
+// reports paths in base-path form, as returned before symlink support.
+// Symlinks below the root are reported as entries but never descended into.
+func (d *Directory) walkDir(fn fs.WalkDirFunc) error {
+	root, err := d.resolvedRoot()
+	if err != nil {
+		root = d.basePath
+	}
+	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		mapped := d.basePath
+		if path != root {
+			rel, relErr := filepath.Rel(root, path)
+			if relErr != nil {
+				return errors.Join(err, relErr)
+			}
+			mapped = filepath.Join(d.basePath, rel)
+		}
+		return fn(mapped, entry, err)
+	})
 }
 
 // BatchReadToBytes reads multiple files and returns their contents as a map.
