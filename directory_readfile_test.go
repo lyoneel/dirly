@@ -274,7 +274,7 @@ func TestDirectory_ReadFileLines_Error(t *testing.T) {
 				t.Error("ReadToLines() should return error")
 			}
 
-			if result != nil && len(result) > 0 {
+			if len(result) > 0 {
 				t.Errorf("expected nil or empty slice on error, got %v", result)
 			}
 		})

@@ -99,9 +99,9 @@ func TestDirectoryBuilder_WithDefaultOwnership(t *testing.T) {
 		gid  int
 	}{
 		{
-			name: "set custom uid/gid",
-			uid:  1000,
-			gid:  1000,
+			name: "set current uid/gid",
+			uid:  os.Getuid(),
+			gid:  os.Getgid(),
 		},
 	}
 
@@ -119,8 +119,8 @@ func TestDirectoryBuilder_WithDefaultOwnership(t *testing.T) {
 				t.Errorf("WriteFromBytes() unexpected error: %v", err)
 			}
 
-			// Note: On non-root systems, Chown may fail silently or be ignored.
-			// This test verifies the method is called without error.
+			// Ownership failures are returned as errors (ErrOwnership); the current
+			// uid/gid is always allowed, so this write must succeed.
 		})
 	}
 }
@@ -165,7 +165,7 @@ func TestDirectoryBuilder_WithDefaultOwnershipAndPermissions(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	dir := NewFilteredDirectory(tmpDir).
-		WithDefaultOwnership(1000, 1000).
+		WithDefaultOwnership(os.Getuid(), os.Getgid()).
 		WithDefaultPermissions(0644).
 		Build()
 

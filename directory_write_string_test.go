@@ -143,8 +143,8 @@ func TestDirectory_WriteFromString_UsesOwnership(t *testing.T) {
 			name:       "file written with ownership",
 			filename:   "test.txt",
 			content:    "hello world",
-			defaultUID: 1000,
-			defaultGID: 1000,
+			defaultUID: os.Getuid(),
+			defaultGID: os.Getgid(),
 		},
 	}
 
