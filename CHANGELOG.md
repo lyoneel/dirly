@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-23
+
+Minor release that adds a streaming open with the same path and symlink checks as the read helpers.
+
+### Added
+
+- `Directory.Open(name)` returns an `*os.File` for reading with the read helpers' checks: relative names only, no `../` or absolute paths, and the symlink policy enforced. Under `FollowWithinRoot` and `NoFollow` it opens through `os.Root` at the resolved root; under `FollowAny` it opens the resolved path directly. Like the other read helpers it does not apply extension or pattern filters. A failed open returns the OS `*fs.PathError`, so `errors.Is(err, os.ErrNotExist)` and `os.IsNotExist(err)` both work; policy refusals match `ErrPathEscapesRoot` or `ErrSymlinkNotAllowed`.
+
+### Changed
+
+- `ReadToBuff`, `ReadToScanner`, and `ReadToBytes` are now built on `Open`. Their results and error messages are unchanged.
+
 ## [1.2.0] - 2026-11-23
 
 Minor release with a security-relevant behavior change: by default, symlinks that resolve outside the directory are now refused.
@@ -61,6 +73,7 @@ Minor release with a security-relevant behavior change: by default, symlinks tha
 
 - Initial public snapshot of the library with README and MIT license.
 
-[Unreleased]: https://gitlab.com/lyoneel/dirly/-/compare/v1.2.0...HEAD
+[Unreleased]: https://gitlab.com/lyoneel/dirly/-/compare/v1.3.0...HEAD
+[1.3.0]: https://gitlab.com/lyoneel/dirly/-/compare/v1.2.0...v1.3.0
 [1.2.0]: https://gitlab.com/lyoneel/dirly/-/compare/v1.1.0...v1.2.0
 [1.1.0]: https://gitlab.com/lyoneel/dirly/-/tags/v1.1.0

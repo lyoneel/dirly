@@ -67,7 +67,7 @@ Key operations on the resulting `*Directory`:
 | Group | Methods |
 |-------|---------|
 | Inspection | `BasePath`, `ResolvedBasePath`, `SymlinkPolicy`, `FilterConfig`, `Exists`, `AbsPath` |
-| Single-file read | `ReadToBytes`, `ReadToString`, `ReadToLines`, `ReadToBuff`, `ReadToScanner` |
+| Single-file read | `Open`, `ReadToBytes`, `ReadToString`, `ReadToLines`, `ReadToBuff`, `ReadToScanner` |
 | Single-file write | `WriteFromBytes`, `WriteFromString`, `WriteFromLines`, `WriteFromBuff`, `WriteFromScanner` |
 | Batch I/O | `BatchReadToBytes`, `BatchReadToLines`, `BatchWriteFromBytes`, `BatchWriteFromLines`, and the matching Buff and Scanner variants |
 | Glob search | `GetAllByGlobAbs`, `GetAllByGlobRel` |
@@ -125,6 +125,26 @@ Limitations, stated plainly:
 - `FollowWithinRoot` and `NoFollow` run file operations through Go's `os.Root`, opened at the resolved root. On Linux, macOS, BSD, and Windows, a symlink swapped in after dirly's check still cannot make an operation escape the root. A swap can still redirect an operation to a different file *inside* the root, and under `NoFollow` a symlink created after the check may be followed, though only within the root. On `GOOS=js`, `os.Root` itself is vulnerable to these races. `Chmod` and `Chown` on Unix share `os.Root`'s documented race, where a file replaced by a symlink mid-call may have the link changed instead.
 - If the base path symlink is later pointed somewhere else, an existing `Directory` keeps the location it resolved at construction.
 - Hard links and bind mounts are not detected. Anyone who can already write into the directory can still replace its files. The policy stops links from quietly pulling reads and writes outside the directory.
+
+### Streaming reads with Open
+
+`Open(name)` returns a plain `*os.File` for reading, with the same checks as the `Read*` helpers: relative names only, no traversal, and the symlink policy enforced. Under `FollowWithinRoot` and `NoFollow` the file is opened through `os.Root` at the resolved root. Use it when your code does its own buffering or scanning, for example a `bufio.Scanner` with a larger buffer; `ReadToBuff` and `ReadToScanner` are `Open` plus a `bufio` wrapper.
+
+```go
+f, err := dir.Open("notes/today.md")
+switch {
+case errors.Is(err, os.ErrNotExist): // os.IsNotExist(err) works too
+case errors.Is(err, dirly.ErrPathEscapesRoot), errors.Is(err, dirly.ErrSymlinkNotAllowed):
+    // refused by the symlink policy
+case err != nil:
+    return err
+}
+defer f.Close()
+sc := bufio.NewScanner(f)
+sc.Buffer(make([]byte, 0, 64*1024), 1<<20) // your own limits
+```
+
+Like the other read helpers, `Open` does not apply the builder's extension or pattern filters; filter with `Exists` or the glob methods first if needed. The returned file stays valid after dirly closes its `os.Root`.
 
 ### Writes and Ownership
 

@@ -85,8 +85,9 @@ All builder methods return the same builder instance for method chaining. Config
 | `ReadToBytes(filename string) ([]byte, error)` | Reads the entire file into memory as raw bytes. Returns an error if the filename is empty or the file cannot be read. |
 | `ReadToString(filename string) (string, error)` | Reads the file and converts its contents to a string. Internally uses ReadToBytes then converts to string. |
 | `ReadToLines(filename string) ([]string, error)` | Reads the file and splits it into lines by newline characters (`\n`). Trailing newlines are handled automatically (empty last element removed if present). |
-| `ReadToBuff(filename string) (*os.File, *bufio.Reader, error)` | Opens a file and returns both the file handle and a buffered reader for efficient streaming reads. Caller is responsible for closing the file. Returns an error if filename is empty or file cannot be opened. |
-| `ReadToScanner(filename string) (*os.File, *bufio.Scanner, error)` | Opens a file and returns both the file handle and a scanner for line-by-line reading. Scanner uses default buffer size (64KB). Caller is responsible for closing the file. Returns an error if filename is empty or file cannot be opened. |
+| `Open(filename string) (*os.File, error)` | Opens a file for reading with the same validation and symlink policy as the other read helpers, through `os.Root` under `FollowWithinRoot` and `NoFollow`. No buffering and no extension or pattern filtering. Open failures are the OS `*fs.PathError` (so `os.IsNotExist` works); policy refusals match `ErrPathEscapesRoot` or `ErrSymlinkNotAllowed`. Caller closes the file. |
+| `ReadToBuff(filename string) (*os.File, *bufio.Reader, error)` | `Open` plus a `bufio.Reader`: returns both the file handle and a buffered reader for efficient streaming reads. Caller is responsible for closing the file. Returns an error if filename is empty or file cannot be opened. |
+| `ReadToScanner(filename string) (*os.File, *bufio.Scanner, error)` | `Open` plus a `bufio.Scanner`: returns both the file handle and a scanner for line-by-line reading. Scanner uses default buffer size (64KB). Caller is responsible for closing the file. Returns an error if filename is empty or file cannot be opened. |
 
 **Batch Reads:**
 
