@@ -58,7 +58,8 @@ All builder methods return the same builder instance for method chaining. Config
 | `Match(patterns []string, include bool)` | Low-level API to add patterns without validation. If `include` is true, patterns go to IncludePatterns; otherwise to ExcludePatterns. Use for advanced use cases. |
 | `MatchNested(match bool)` | Enable/disable nested path matching (default: `true`). When false, only filenames are matched unless the pattern contains `/`. When true, both filename and full relative path are checked. |
 | `CaseSensitive(sensitive bool)` | Set explicit case sensitivity (default: OS behavior via `filepath.Match`). Set to true for always case-sensitive matching regardless of platform. |
-| `WithDefaultOwnership(uid, gid int)` | Set default UID/GID for all new files written to this directory. Use `-1` to skip setting a specific value. Ownership is applied as best-effort after file creation. |
+| `WithDefaultOwnership(uid, gid int)` | Set default UID/GID for all new files written to this directory. Use `-1` to skip setting a specific value. Ownership is applied to the temporary file before the atomic rename. If it fails, the write returns an error wrapping `ErrOwnership` and the target is left unchanged. |
+| `WithSymlinkPolicy(policy SymlinkPolicy)` | Set how symlinks below the root are treated: `FollowWithinRoot` (default), `FollowAny` (v1.1.0 behavior), or `NoFollow`. See Symlink Policy below. |
 | `WithDefaultPermissions(perm os.FileMode)` | Set default permissions for all new files written to this directory. Use `0` to skip setting permissions and use the provided value instead. Defaults to `0644` when neither perm nor defaultPerm is set. |
 | `Build() *Directory` | Create the final Directory instance with configured filters. Filters are immutable after this point. |
 
@@ -71,7 +72,9 @@ All builder methods return the same builder instance for method chaining. Config
 | `BasePath() string` | Returns the base directory path that all operations are scoped to. |
 | `FilterConfig() FilterConfig` | Returns a copy of the filter configuration, including include patterns, exclude patterns, and allowed extensions. |
 | `Exists(filename string) bool` | Checks if a file exists in this directory and passes all configured filters. Returns false for directories or non-existent files. |
-| `AbsPath(name string) (string, error)` | Converts a relative path name to its absolute resolved path. Validates against path traversal attacks. |
+| `AbsPath(name string) (string, error)` | Converts a relative path name to its absolute path in base-path form. Validates against path traversal and the symlink policy. |
+| `ResolvedBasePath() (string, error)` | Returns the base path resolved through symlinks, which is the boundary the symlink policy enforces. Returns an error if the directory does not exist yet. |
+| `SymlinkPolicy() SymlinkPolicy` | Returns the active symlink policy. |
 
 #### Read Operations
 
@@ -101,7 +104,7 @@ All builder methods return the same builder instance for method chaining. Config
 
 | Method | Description |
 |--------|-------------|
-| `WriteFromBytes(filename string, data []byte, perm os.FileMode) error` | Writes byte content to a file. If `perm` is 0 and defaultPerm is configured, uses defaultPerm; otherwise falls back to `0644`. Creates parent directories as needed. Applies ownership if configured. |
+| `WriteFromBytes(filename string, data []byte, perm os.FileMode) error` | Writes byte content to a file. If `perm` is 0 and defaultPerm is configured, uses defaultPerm; otherwise falls back to `0644`. Creates parent directories as needed. Applies ownership if configured. The write is atomic (temp file, fsync, rename). Existing files keep their mode and owner. |
 | `WriteFromString(filename string, s string, perm os.FileMode) error` | Writes string content to a file by converting to bytes first. Same permission and ownership handling as WriteFromBytes. |
 | `WriteFromLines(filename string, lines []string, perm os.FileMode) error` | Writes multiple lines to a file, joining them with newline characters. Each line gets a trailing newline. Same permission and ownership handling. |
 | `WriteFromBuff(filename string, r *bufio.Reader, perm os.FileMode) error` | Reads all data from a buffered reader and writes it to a file. Useful for streaming large files without loading everything into memory first. |
@@ -316,6 +319,21 @@ The `resolvePath` method:
 2. Joins and cleans the path using `filepath.Join` and `filepath.Clean`
 3. Verifies the resolved path stays within the base directory
 4. Allows exact match for basePath itself (for edge cases)
+
+#### Symlink Policy
+
+After the textual check, `resolveTarget` walks the path component by component from the resolved root (`walkSymlinks`). It follows symlinks like the kernel does, but it tolerates a missing tail (new files) and dangling links:
+
+1. The root is resolved once with `filepath.EvalSymlinks` in `NewDirectory` and `Build()`, or on each operation while it doesn't exist.
+2. `FollowWithinRoot` refuses a resolved target outside the root (`*SymlinkError` wrapping `ErrPathEscapesRoot`).
+3. `NoFollow` refuses any symlink component (`ErrSymlinkNotAllowed`).
+4. `FollowAny` skips the boundary check.
+5. Except under `FollowAny`, the operation then runs through `os.Root` opened at the resolved root, using the resolved relative path. Even if the check races with a symlink swap, the kernel-level containment of `os.Root` still applies.
+6. Removals don't resolve the last component, so a link is removed and its target is not.
+
+#### Atomic Writes
+
+`writeWithOwnership` (atomic.go) writes to `.<name>.tmp-<random>` in the target's directory, created with `O_EXCL`. It sets the mode (an existing file's mode is kept) and ownership, fsyncs, renames over the resolved target, and fsyncs the directory (best effort, skipped on Windows). On any error the temp file is removed.
 
 #### Glob Pattern Validation
 
