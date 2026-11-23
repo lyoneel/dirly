@@ -2,7 +2,7 @@
 
 All notable changes in the dirly project are documented in this file. The format is based on Keep a Changelog, and the project follows Semantic Versioning.
 
-## v1.2.0 - Unreleased
+## v1.2.0 - 2026-11-23
 
 Minor release with a security-relevant behavior change: by default, symlinks that resolve outside the directory are now refused.
 
